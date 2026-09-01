@@ -15,7 +15,7 @@ pub enum CommitOutcome<E> {
 }
 
 pub struct Oracle {
-    pub(super) write_serialize_lock: Mutex<BTreeMap<u64, ConflictManager>>,
+    pub(super) write_serialize_lock: Mutex<BTreeMap<SeqNo, ConflictManager>>,
     pub(super) snapshot_tracker: SnapshotTracker,
 }
 
@@ -43,8 +43,6 @@ impl Oracle {
                 .any(|(_ts, other_conflict_checker)| {
                     conflict_checker.has_conflict(other_conflict_checker)
                 });
-
-        self.snapshot_tracker.close_raw(instant);
 
         // TODO: This can be expensive and should probably be done in a background worker, or a after a memtable rotation
         let safe_to_gc = self.snapshot_tracker.get_seqno_safe_to_gc();
@@ -115,6 +113,26 @@ mod tests {
         }
 
         assert!(dbg!(db.oracle.write_serialize_lock.lock().unwrap().len()) < 10_000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn committing_transaction_closes_only_its_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+        let tmpdir = tempfile::tempdir()?;
+        let db = OptimisticTxDatabase::builder(tmpdir.path()).open()?;
+        let tree = db.keyspace("foo", KeyspaceCreateOptions::default)?;
+
+        let mut tx1 = db.write_tx()?;
+        let tx2 = db.write_tx()?;
+        assert_eq!(2, db.inner().supervisor.snapshot_tracker.open_snapshots());
+
+        tx1.insert(tree.inner(), "hello", "world");
+        tx1.commit()??;
+        assert_eq!(1, db.inner().supervisor.snapshot_tracker.open_snapshots());
+
+        drop(tx2);
+        assert_eq!(0, db.inner().supervisor.snapshot_tracker.open_snapshots());
 
         Ok(())
     }

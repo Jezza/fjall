@@ -11,7 +11,7 @@ use crate::{
     keyspace::{name::is_valid_keyspace_name, KeyspaceKey},
     locked_file::LockedFileGuard,
     meta_keyspace::MetaKeyspace,
-    poison_dart::PoisonDart,
+    poison::{PoisonDart, PoisonSignal},
     recovery::{recover_keyspaces, recover_sealed_memtables},
     snapshot::Snapshot,
     snapshot_tracker::SnapshotTracker,
@@ -27,10 +27,7 @@ use lsm_tree::{AbstractTree, SequenceNumberCounter};
 use std::{
     fs::remove_dir_all,
     path::Path,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize},
-        Arc, Mutex, RwLock,
-    },
+    sync::{atomic::AtomicUsize, Arc, Mutex, RwLock},
 };
 
 pub type Keyspaces = HashMap<KeyspaceKey, Keyspace>;
@@ -52,7 +49,7 @@ pub struct DatabaseInner {
     pub(crate) active_thread_counter: Arc<AtomicUsize>,
 
     /// True if fsync failed
-    pub(crate) is_poisoned: Arc<AtomicBool>,
+    pub(crate) is_poisoned: PoisonSignal,
 
     pub(crate) stats: Arc<Stats>,
 
@@ -288,7 +285,7 @@ impl Database {
     /// Returns the disk space usage of the journal.
     #[doc(hidden)]
     pub fn journal_disk_space(&self) -> crate::Result<u64> {
-        Ok(self.supervisor.journal.get_writer().len()?
+        Ok(self.supervisor.journal.get_writer()?.len()?
             + self
                 .supervisor
                 .journal_manager
@@ -351,20 +348,16 @@ impl Database {
     ///
     /// Returns error, if an IO error occurred.
     pub fn persist(&self, mode: PersistMode) -> crate::Result<()> {
-        if self.is_poisoned.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.is_poisoned.is_poisoned() {
             return Err(crate::Error::Poisoned);
         }
 
-        if let Err(e) = self.supervisor.journal.persist(mode) {
-            self.is_poisoned
-                .store(true, std::sync::atomic::Ordering::Release);
-
+        self.supervisor.journal.persist(mode).inspect_err(|e| {
             log::error!(
-                "flush failed, which is a FATAL, and possibly hardware-related, failure: {e:?}"
+                "flush failed, which is a FATAL, and possibly hardware-related, failure: {e:?}",
             );
-
-            return Err(crate::Error::Poisoned);
-        }
+            self.is_poisoned.poison();
+        })?;
 
         Ok(())
     }
@@ -587,7 +580,7 @@ impl Database {
         log::debug!("journal recovery result: {journal_recovery:#?}");
 
         let active_journal = Arc::new(journal_recovery.active);
-        active_journal.get_writer().persist(PersistMode::SyncAll)?;
+        active_journal.get_writer()?.persist(PersistMode::SyncAll)?;
 
         let sealed_journals = journal_recovery.sealed;
 
@@ -595,11 +588,6 @@ impl Database {
 
         let seqno = SequenceNumberCounter::default();
         let visible_seqno = SequenceNumberCounter::default();
-
-        let keyspaces = Arc::new(RwLock::new(Keyspaces::with_capacity_and_hasher(
-            10,
-            xxhash_rust::xxh3::Xxh3Builder::new(),
-        )));
 
         let meta_tree = lsm_tree::Config::new(
             config.path.join(KEYSPACES_FOLDER).join("0"),
@@ -624,6 +612,8 @@ impl Database {
         ]))
         .open()?;
 
+        let keyspaces = Arc::new(RwLock::default());
+
         let meta_keyspace = MetaKeyspace::new(
             meta_tree,
             keyspaces.clone(),
@@ -646,8 +636,6 @@ impl Database {
         let active_thread_counter = Arc::<AtomicUsize>::default();
         let stats = Arc::<Stats>::default();
 
-        let is_poisoned = Arc::<AtomicBool>::default();
-
         // Construct (empty) database, then fill back with keyspace data
         let inner = DatabaseInner {
             supervisor,
@@ -657,7 +645,7 @@ impl Database {
             config,
             stop_signal: lsm_tree::stop_signal::StopSignal::default(),
             active_thread_counter,
-            is_poisoned,
+            is_poisoned: PoisonSignal::default(),
             stats,
             lock_file,
         };
@@ -779,7 +767,10 @@ impl Database {
             .values()
         {
             if keyspace.tree.sealed_memtable_count() > 0 {
-                log::trace!("Queuing keyspace {:?} to get flushed", keyspace.name());
+                log::debug!(
+                    "Queuing keyspace {:?} to get flushed because sealed memtables > 0",
+                    keyspace.name(),
+                );
 
                 // IMPORTANT: Add task to flush manager, so it can be flushed
                 db.supervisor
@@ -789,6 +780,16 @@ impl Database {
                     }));
 
                 keyspace.worker_messager.send(WorkerMessage::Flush).ok();
+            } else if keyspace.tree.l0_run_count() > 0 {
+                log::debug!(
+                    "Queuing keyspace {:?} to maybe get compacted because L0 runs > 0",
+                    keyspace.name(),
+                );
+
+                keyspace
+                    .worker_messager
+                    .send(WorkerMessage::Compact(keyspace.clone()))
+                    .ok();
             }
         }
 
@@ -800,7 +801,7 @@ impl Database {
             &db.active_thread_counter,
         )?;
 
-        log::trace!("Recovery successful");
+        log::trace!("Database recovery successful");
 
         Ok(db)
     }
@@ -837,11 +838,6 @@ impl Database {
         let seqno = SequenceNumberCounter::default();
         let visible_seqno = SequenceNumberCounter::default();
 
-        let keyspaces = Arc::new(RwLock::new(Keyspaces::with_capacity_and_hasher(
-            10,
-            xxhash_rust::xxh3::Xxh3Builder::new(),
-        )));
-
         let meta_tree = lsm_tree::Config::new(
             config.path.join(KEYSPACES_FOLDER).join("0"),
             seqno.clone(),
@@ -865,6 +861,8 @@ impl Database {
         ]))
         .open()?;
 
+        let keyspaces = Arc::new(RwLock::default());
+
         let meta_keyspace = MetaKeyspace::new(
             meta_tree,
             keyspaces.clone(),
@@ -887,8 +885,6 @@ impl Database {
         let active_thread_counter = Arc::<AtomicUsize>::default();
         let stats = Arc::<Stats>::default();
 
-        let is_poisoned = Arc::<AtomicBool>::default();
-
         let inner = DatabaseInner {
             supervisor,
             worker_pool: WorkerPool::prepare(),
@@ -897,7 +893,7 @@ impl Database {
             config,
             stop_signal: lsm_tree::stop_signal::StopSignal::default(),
             active_thread_counter,
-            is_poisoned,
+            is_poisoned: PoisonSignal::default(),
             stats,
             lock_file,
         };

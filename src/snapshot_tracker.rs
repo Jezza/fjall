@@ -99,7 +99,7 @@ impl SnapshotTracker {
         SnapshotNonce::new(nonce.instant, self.clone())
     }
 
-    pub fn close(&self, nonce: &SnapshotNonce) {
+    pub(crate) fn close(&self, nonce: &SnapshotNonce) {
         self.close_raw(nonce.instant);
     }
 

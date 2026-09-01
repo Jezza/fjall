@@ -15,6 +15,7 @@ use crate::{
     flush::Task as FlushTask,
     ingestion::Ingestion,
     locked_file::LockedFileGuard,
+    poison::PoisonSignal,
     stats::Stats,
     supervisor::Supervisor,
     worker_pool::WorkerMessage,
@@ -74,7 +75,7 @@ pub struct KeyspaceInner {
     pub(crate) is_deleted: AtomicBool,
 
     /// If `true`, fsync failed during persisting, see `Error::Poisoned`
-    pub(crate) is_poisoned: Arc<AtomicBool>,
+    pub(crate) is_poisoned: PoisonSignal,
 
     /// LSM-tree wrapper
     #[doc(hidden)]
@@ -234,30 +235,36 @@ impl Keyspace {
     ///
     /// Will return `Err` if an IO error occurs.
     pub fn clear(&self) -> crate::Result<()> {
-        use std::sync::atomic::Ordering;
-
-        let mut journal_writer = self.supervisor.journal.get_writer();
+        let mut journal_writer = self.supervisor.journal.get_writer()?;
 
         // IMPORTANT: Check the poisoned flag after getting journal mutex, otherwise TOCTOU
-        if self.is_poisoned.load(Ordering::Relaxed) {
+        if self.is_poisoned.is_poisoned() {
             return Err(crate::Error::Poisoned);
         }
 
         let seqno = self.supervisor.seqno.next();
 
-        journal_writer.write_clear(self.id, seqno)?;
+        journal_writer
+            .write_clear(self.id, seqno)
+            .inspect_err(|e| {
+                log::error!(
+                    "persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}",
+                );
+                self.is_poisoned.poison();
+            })?;
 
         if !self.config.manual_journal_persist {
             journal_writer
                 .persist(crate::PersistMode::Buffer)
-                .map_err(|e| {
+                .inspect_err(|e| {
                     log::error!("persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}");
-                    self.is_poisoned.store(true, Ordering::Relaxed);
-                    e
+                    self.is_poisoned.poison();
                 })?;
         }
 
-        self.tree.clear()?;
+        self.tree.clear().inspect_err(|_| {
+            self.is_poisoned.poison();
+        })?;
 
         self.supervisor.snapshot_tracker.publish(seqno);
 
@@ -719,7 +726,7 @@ impl Keyspace {
     #[doc(hidden)]
     pub fn rotate_memtable(&self) -> crate::Result<bool> {
         log::trace!("acquiring journal lock");
-        let journal_writer = self.supervisor.journal.get_writer();
+        let journal_writer = self.supervisor.journal.get_writer()?;
         let active_memtable_id = self.tree.active_memtable().id();
         self.inner_rotate_memtable(journal_writer, active_memtable_id)
     }
@@ -916,24 +923,27 @@ impl Keyspace {
         let key = key.into();
         let value = value.into();
 
-        let mut journal_writer = self.supervisor.journal.get_writer();
+        let mut journal_writer = self.supervisor.journal.get_writer()?;
 
         // IMPORTANT: Check the poisoned flag after getting journal mutex, otherwise TOCTOU
-        if self.is_poisoned.load(Ordering::Relaxed) {
+        if self.is_poisoned.is_poisoned() {
             return Err(crate::Error::Poisoned);
         }
 
         let seqno = self.supervisor.seqno.next();
 
-        journal_writer.write_raw(self.id, &key, &value, lsm_tree::ValueType::Value, seqno)?;
+        journal_writer
+            .write_raw(self.id, &key, &value, lsm_tree::ValueType::Value, seqno)
+            .inspect_err(|_| {
+                self.is_poisoned.poison();
+            })?;
 
         if !self.config.manual_journal_persist {
             journal_writer
                 .persist(crate::PersistMode::Buffer)
-                .map_err(|e| {
+                .inspect_err(|e| {
                     log::error!("persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}");
-                    self.is_poisoned.store(true, Ordering::Relaxed);
-                    e
+                    self.is_poisoned.poison();
                 })?;
         }
 
@@ -987,24 +997,27 @@ impl Keyspace {
 
         let key = key.into();
 
-        let mut journal_writer = self.supervisor.journal.get_writer();
+        let mut journal_writer = self.supervisor.journal.get_writer()?;
 
         // IMPORTANT: Check the poisoned flag after getting journal mutex, otherwise TOCTOU
-        if self.is_poisoned.load(Ordering::Relaxed) {
+        if self.is_poisoned.is_poisoned() {
             return Err(crate::Error::Poisoned);
         }
 
         let seqno = self.supervisor.seqno.next();
 
-        journal_writer.write_raw(self.id, &key, &[], lsm_tree::ValueType::Tombstone, seqno)?;
+        journal_writer
+            .write_raw(self.id, &key, &[], lsm_tree::ValueType::Tombstone, seqno)
+            .inspect_err(|_| {
+                self.is_poisoned.poison();
+            })?;
 
         if !self.config.manual_journal_persist {
             journal_writer
                 .persist(crate::PersistMode::Buffer)
-                .map_err(|e| {
+                .inspect_err(|e| {
                     log::error!("persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}");
-                    self.is_poisoned.store(true, Ordering::Relaxed);
-                    e
+                    self.is_poisoned.poison();
                 })?;
         }
 
@@ -1070,32 +1083,35 @@ impl Keyspace {
 
         let key = key.into();
 
-        let mut journal_writer = self.supervisor.journal.get_writer();
+        let mut journal_writer = self.supervisor.journal.get_writer()?;
 
         // IMPORTANT: Check the poisoned flag after getting journal mutex, otherwise TOCTOU
-        if self.is_poisoned.load(Ordering::Relaxed) {
+        if self.is_poisoned.is_poisoned() {
             return Err(crate::Error::Poisoned);
         }
 
         let seqno = self.supervisor.seqno.next();
 
-        journal_writer.write_raw(
-            self.id,
-            &key,
-            &[],
-            lsm_tree::ValueType::WeakTombstone,
-            seqno,
-        )?;
+        journal_writer
+            .write_raw(
+                self.id,
+                &key,
+                &[],
+                lsm_tree::ValueType::WeakTombstone,
+                seqno,
+            )
+            .inspect_err(|_| {
+                self.is_poisoned.poison();
+            })?;
 
         if !self.config.manual_journal_persist {
             journal_writer
                 .persist(crate::PersistMode::Buffer)
-                .map_err(|e| {
+                .inspect_err(|e| {
                     log::error!(
                         "persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}"
                     );
-                    self.is_poisoned.store(true, Ordering::Relaxed);
-                    e
+                    self.is_poisoned.poison();
                 })?;
         }
 

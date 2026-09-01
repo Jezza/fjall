@@ -118,7 +118,7 @@ mod keyspace;
 mod locked_file;
 mod meta_keyspace;
 mod path;
-mod poison_dart;
+mod poison;
 mod readable;
 mod recovery;
 mod snapshot;
@@ -131,7 +131,8 @@ mod version;
 mod worker_pool;
 mod write_buffer_manager;
 
-pub(crate) type HashMap<K, V> = std::collections::HashMap<K, V, xxhash_rust::xxh3::Xxh3Builder>;
+pub(crate) type HashMap<K, V> =
+    std::collections::HashMap<K, V, xxhash_rust::xxh3::Xxh3DefaultBuilder>;
 
 /// Configuration policies
 pub mod config {

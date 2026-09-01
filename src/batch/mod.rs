@@ -98,34 +98,36 @@ impl WriteBatch {
     /// Will return `Err` if an IO error occurs.
     #[allow(clippy::missing_panics_doc)]
     pub fn commit(mut self) -> crate::Result<()> {
-        use std::sync::atomic::Ordering;
-
         if self.is_empty() {
             return Ok(());
         }
 
         log::trace!("batch: Acquiring journal writer");
-        let mut journal_writer = self.db.supervisor.journal.get_writer();
+        let mut journal_writer = self.db.supervisor.journal.get_writer()?;
 
         // IMPORTANT: Check the poisoned flag after getting journal mutex, otherwise TOCTOU
-        if self.db.is_poisoned.load(Ordering::Relaxed) {
+        if self.db.is_poisoned.is_poisoned() {
             return Err(crate::Error::Poisoned);
         }
 
         let batch_seqno = self.db.supervisor.seqno.next();
 
-        let _ = journal_writer.write_batch(self.data.iter(), self.data.len(), batch_seqno);
+        journal_writer
+            .write_batch(self.data.iter(), self.data.len(), batch_seqno)
+            .inspect_err(|e| {
+                log::error!(
+                    "persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}",
+                );
+                self.db.is_poisoned.poison();
+            })?;
 
         if let Some(mode) = self.durability {
-            if let Err(e) = journal_writer.persist(mode) {
-                self.db.is_poisoned.store(true, Ordering::Release);
-
+            journal_writer.persist(mode).inspect_err(|e| {
                 log::error!(
-                    "persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}"
+                    "persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}",
                 );
-
-                return Err(crate::Error::Poisoned);
-            }
+                self.db.is_poisoned.poison();
+            })?;
         }
 
         // TODO: maybe we can use a stack alloc hashset/vec here, such as smallset
